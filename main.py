@@ -1,10 +1,12 @@
 # Librerías estándar de Python
+import asyncio
 import os
 import json
 import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
+from contextlib import contextmanager, asynccontextmanager
 
 # Librerías de terceros
 import jwt
@@ -21,16 +23,15 @@ from fastapi import Body, FastAPI, Depends, HTTPException, Query, Request, statu
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
+from fastapi.websockets import WebSocketState
 
 # SQLAlchemy (ORM para bases de datos)
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime, ForeignKey, Text
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, ForeignKey, Text, func
+from sqlalchemy.dialects.postgresql import UUID, ARRAY
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, joinedload, relationship
 
 # Pydantic (para validación de datos en FastAPI)
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 # Inicializar colorama
 init(autoreset=True)
@@ -68,26 +69,31 @@ class Usuario(Base):
     __table_args__ = {"schema": "api"}
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     nombre = Column(String(100), nullable=False)
-    email = Column(String(100), unique=True, nullable=False, index=True)
+    email = Column(String(100), unique=True, nullable=False)
     password = Column(String(100), nullable=False)
     es_admin = Column(Boolean, default=False)
-    fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    fecha_actualizacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     soft_delete = Column(Boolean, default=False)
+
+    dispositivos = relationship("Dispositivo", back_populates="usuario")
 
 class Dispositivo(Base):
     __tablename__ = "dispositivos"
     __table_args__ = {"schema": "api"}
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     usuario_id = Column(UUID(as_uuid=True), ForeignKey("api.usuarios.id", ondelete="CASCADE"))
-    token = Column(String(255), unique=True, nullable=False, index=True)
+    token = Column(String(255), unique=True, nullable=False)
     esta_online = Column(Boolean, default=False)
-    ultimo_acceso = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ultimo_acceso = Column(DateTime(timezone=True), server_default=func.now())
     modelo = Column(String(100))
     sistema_operativo = Column(String(100))
-    fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    fecha_actualizacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     soft_delete = Column(Boolean, default=False)
+
+    usuario = relationship("Usuario", back_populates="dispositivos")
+    notificaciones_dispositivo = relationship("NotificacionDispositivo", back_populates="dispositivo")
 
 class Notificacion(Base):
     __tablename__ = "notificaciones"
@@ -96,45 +102,56 @@ class Notificacion(Base):
     titulo = Column(String(255), nullable=False)
     mensaje = Column(Text, nullable=False)
     imagen_url = Column(Text)
-    fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
-    fecha_actualizacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    dispositivos_objetivo = Column(ARRAY(UUID), default=None)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     soft_delete = Column(Boolean, default=False)
+
+    notificaciones_dispositivo = relationship("NotificacionDispositivo", back_populates="notificacion")
 
 class NotificacionDispositivo(Base):
     __tablename__ = "notificaciones_dispositivo"
     __table_args__ = {"schema": "api"}
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    notificacion_id = Column(UUID(as_uuid=True), ForeignKey("api.notificaciones.id", ondelete="CASCADE"), index=True)
-    dispositivo_id = Column(UUID(as_uuid=True), ForeignKey("api.dispositivos.id", ondelete="CASCADE"), index=True)
+    notificacion_id = Column(UUID(as_uuid=True), ForeignKey("api.notificaciones.id", ondelete="CASCADE"))
+    dispositivo_id = Column(UUID(as_uuid=True), ForeignKey("api.dispositivos.id", ondelete="CASCADE"))
     enviada = Column(Boolean, default=False)
     leida = Column(Boolean, default=False)
-    fecha_envio = Column(DateTime)
-    fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    fecha_actualizacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    sonando = Column(Boolean, default=False)
+    fecha_envio = Column(DateTime(timezone=True))
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     soft_delete = Column(Boolean, default=False)
+
+    notificacion = relationship("Notificacion", back_populates="notificaciones_dispositivo")
+    dispositivo = relationship("Dispositivo", back_populates="notificaciones_dispositivo")
 
 class ConfiguracionSonido(Base):
     __tablename__ = "configuracion_sonidos"
     __table_args__ = {"schema": "api"}
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    usuario_id = Column(UUID(as_uuid=True), ForeignKey("api.usuarios.id", ondelete="CASCADE"), index=True)
-    sonido = Column(String(100), default="default.mp3")
-    fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    fecha_actualizacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    usuario_id = Column(UUID(as_uuid=True), ForeignKey("api.usuarios.id", ondelete="CASCADE"))
+    sonido = Column(String(100), default='default.mp3')
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     soft_delete = Column(Boolean, default=False)
+
+    usuario = relationship("Usuario")
 
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
     __table_args__ = {"schema": "api"}
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    usuario_id = Column(UUID(as_uuid=True), ForeignKey("api.usuarios.id", ondelete="CASCADE"), index=True)
-    token = Column(String(255), unique=True, nullable=False, index=True)
-    fecha_expiracion = Column(DateTime, nullable=False)
-    fecha_creacion = Column(DateTime, default=lambda: datetime.now(timezone.utc))
-    fecha_actualizacion = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    usuario_id = Column(UUID(as_uuid=True), ForeignKey("api.usuarios.id", ondelete="CASCADE"))
+    token = Column(String(255), unique=True, nullable=False)
+    fecha_expiracion = Column(DateTime(timezone=True), nullable=False)
+    fecha_creacion = Column(DateTime(timezone=True), server_default=func.now())
+    fecha_actualizacion = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     soft_delete = Column(Boolean, default=False)
 
-# Modelos Pydantic
+    usuario = relationship("Usuario")
+
+# Modelos Pydantic mejorados
 class UsuarioCrear(BaseModel):
     nombre: str
     email: str
@@ -172,12 +189,13 @@ class NotificacionCrear(BaseModel):
     titulo: str
     mensaje: str
     imagen_url: Optional[str] = None
+    dispositivos_objetivo: Optional[List[uuid.UUID]] = None  # Nuevo campo
 
 class NotificacionSalida(BaseModel):
     id: uuid.UUID
     titulo: str
     mensaje: str
-    imagen_url: Optional[str]
+    imagen_url: str | None
     fecha_creacion: datetime
 
     class Config:
@@ -202,6 +220,19 @@ def get_db():
     finally:
         db.close()
 
+# Context manager para transacciones
+@contextmanager
+def get_db_transaction():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
 # Configuración de OAuth2
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -211,7 +242,12 @@ async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler()
     scheduler.start()
     scheduler.add_job(verificar_dispositivos_inactivos, IntervalTrigger(minutes=5))
+    
+    # Iniciar tarea de mantener vivas las conexiones WebSocket
+    asyncio.create_task(manager.keep_alive())
+    
     yield
+    
     scheduler.shutdown()
 
 # Crear una única instancia de FastAPI
@@ -230,29 +266,55 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Clase para manejar las conexiones WebSocket
+# clase ConnectionManager para manejar reconexiones y asociar conexiones con usuarios
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
+        self.user_connections: Dict[str, str] = {}
 
-    async def connect(self, websocket: WebSocket, client_id: str):
+    async def connect(self, websocket: WebSocket, client_id: str, user_id: str):
         await websocket.accept()
         self.active_connections[client_id] = websocket
-        logger.info(f"Cliente {client_id} conectado")
+        self.user_connections[user_id] = client_id
+        logger.info(f"Cliente {client_id} conectado para el usuario {user_id}")
 
     def disconnect(self, client_id: str):
-        del self.active_connections[client_id]
-        logger.info(f"Cliente {client_id} desconectado")
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
+            for user_id, conn_id in self.user_connections.items():
+                if conn_id == client_id:
+                    del self.user_connections[user_id]
+                    break
+            logger.info(f"Cliente {client_id} desconectado")
 
     async def send_personal_message(self, message: str, client_id: str):
         if client_id in self.active_connections:
-            await self.active_connections[client_id].send_text(message)
-            logger.info(f"Mensaje enviado al cliente {client_id}")
+            websocket = self.active_connections[client_id]
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.send_text(message)
+                logger.info(f"Mensaje enviado al cliente {client_id}")
+            else:
+                logger.warning(f"Intento de enviar mensaje a cliente desconectado {client_id}")
+        else:
+            logger.warning(f"Cliente {client_id} no encontrado para enviar mensaje")
 
     async def broadcast(self, message: str):
         for connection in self.active_connections.values():
-            await connection.send_text(message)
-            logger.info("Mensaje de difusión enviado")
+            if connection.client_state == WebSocketState.CONNECTED:
+                await connection.send_text(message)
+        logger.info("Mensaje de difusión enviado")
+
+    async def keep_alive(self):
+        while True:
+            for client_id, websocket in list(self.active_connections.items()):
+                try:
+                    await websocket.send_text("ping")
+                except WebSocketDisconnect:
+                    self.disconnect(client_id)
+                except Exception as e:
+                    logger.error(f"Error al enviar ping a {client_id}: {str(e)}")
+                    self.disconnect(client_id)
+            await asyncio.sleep(30)  # Enviar ping cada 30 segundos
 
 manager = ConnectionManager()
 
@@ -474,6 +536,68 @@ async def registrar_dispositivo(
         logger.error(f"Error al registrar dispositivo: {str(e)}")
         raise HTTPException(status_code=500, detail="Error interno al registrar dispositivo")
 
+# Ruta para que los dispositivos informen su estado
+@app.post("/dispositivos/{dispositivo_id}/ping")
+async def dispositivo_ping(
+    dispositivo_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    with get_db_transaction() as db:
+        try:
+            dispositivo = db.query(Dispositivo).filter(Dispositivo.id == dispositivo_id, Dispositivo.usuario_id == current_user.id).first()
+            if not dispositivo:
+                raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
+            
+            dispositivo.esta_online = True
+            dispositivo.ultimo_acceso = datetime.now(timezone.utc)
+            
+            db.commit()
+            
+            background_tasks.add_task(enviar_notificaciones_pendientes, str(dispositivo_id))
+            
+            return {"mensaje": "Estado del dispositivo actualizado"}
+        except Exception as e:
+            logger.error(f"Error al actualizar estado del dispositivo: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error al actualizar el estado del dispositivo")
+
+# Ruta nueva para reintento manual de envío de notificaciones
+@app.post("/notificaciones/{notificacion_id}/reenviar")
+async def reenviar_notificacion(
+    notificacion_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.es_admin:
+        raise HTTPException(status_code=403, detail="No tienes permiso para reenviar notificaciones")
+    
+    with get_db_transaction() as db:
+        try:
+            notificacion = db.query(Notificacion).filter(
+                Notificacion.id == notificacion_id,
+                Notificacion.soft_delete == False
+            ).first()
+            
+            if not notificacion:
+                raise HTTPException(status_code=404, detail="Notificación no encontrada")
+            
+            # Reiniciar el estado de envío para todas las asociaciones de esta notificación
+            db.query(NotificacionDispositivo).filter(
+                NotificacionDispositivo.notificacion_id == notificacion_id,
+                NotificacionDispositivo.soft_delete == False
+            ).update({"enviada": False, "fecha_envio": None})
+            
+            db.commit()
+            
+            background_tasks.add_task(enviar_notificaciones, str(notificacion_id))
+            
+            return {"mensaje": "Reenvío de notificación iniciado"}
+        except Exception as e:
+            logger.error(f"Error al reenviar notificación: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error al reenviar la notificación")
+
 @app.post("/notificaciones", response_model=NotificacionSalida)
 async def crear_notificacion(
     notificacion: NotificacionCrear,
@@ -484,30 +608,46 @@ async def crear_notificacion(
     if not current_user.es_admin:
         logger.warning(f"Usuario no autorizado {current_user.email} intentó crear una notificación")
         raise HTTPException(status_code=403, detail="No tienes permiso para crear notificaciones")
+    
     try:
-        db_notificacion = Notificacion(**notificacion.model_dump())
+        db_notificacion = Notificacion(**notificacion.dict(exclude={'dispositivos_objetivo'}))
         db.add(db_notificacion)
-        db.flush()  # Para obtener el ID de la notificación
+        db.flush()
 
-        # Crear entradas en NotificacionDispositivo para todos los dispositivos
-        dispositivos = db.query(Dispositivo).filter(Dispositivo.soft_delete == False).all()
+        if notificacion.dispositivos_objetivo:
+            dispositivos = db.query(Dispositivo).filter(
+                Dispositivo.id.in_(notificacion.dispositivos_objetivo),
+                Dispositivo.soft_delete == False
+            ).all()
+        else:
+            dispositivos = db.query(Dispositivo).filter(Dispositivo.soft_delete == False).all()
+
         for dispositivo in dispositivos:
             notif_dispositivo = NotificacionDispositivo(
                 notificacion_id=db_notificacion.id,
                 dispositivo_id=dispositivo.id,
-                leida=False  # Asegurarse de que se marca como no leída
+                leida=False,
+                sonando=True
             )
             db.add(notif_dispositivo)
 
         db.commit()
         db.refresh(db_notificacion)
         
-        # Log para depuración
         logger.info(f"Notificación {db_notificacion.id} creada y asociada a {len(dispositivos)} dispositivos")
         
         background_tasks.add_task(enviar_notificaciones, str(db_notificacion.id))
         
-        return db_notificacion
+        # Crear un diccionario con los datos de la notificación
+        notificacion_dict = {
+            "id": db_notificacion.id,
+            "titulo": db_notificacion.titulo,
+            "mensaje": db_notificacion.mensaje,
+            "imagen_url": db_notificacion.imagen_url,
+            "fecha_creacion": db_notificacion.fecha_creacion
+        }
+        
+        return NotificacionSalida(**notificacion_dict)
     except Exception as e:
         db.rollback()
         logger.error(f"Error al crear notificación: {str(e)}")
@@ -526,12 +666,48 @@ async def leer_notificaciones(
         notificaciones = db.query(Notificacion).join(NotificacionDispositivo).filter(
             NotificacionDispositivo.dispositivo_id.in_(dispositivo_ids),
             Notificacion.soft_delete == False
-        ).offset(skip).limit(limit).all()
+        ).order_by(Notificacion.fecha_creacion.desc()).offset(skip).limit(limit).all()
         logger.info(f"Usuario {current_user.email} accedió a las notificaciones (paginadas)")
         return notificaciones
     except Exception as e:
         logger.error(f"Error al leer notificaciones paginadas: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al obtener las notificaciones")
+
+@app.get("/notificaciones/estadisticas")
+async def obtener_estadisticas_notificaciones(
+    current_user: Usuario = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user.es_admin:
+        raise HTTPException(status_code=403, detail="No tienes permiso para ver estadísticas")
+    
+    try:
+        total_notificaciones = db.query(func.count(Notificacion.id)).filter(Notificacion.soft_delete == False).scalar()
+        
+        notificaciones_enviadas = db.query(func.count(NotificacionDispositivo.id)).filter(
+            NotificacionDispositivo.enviada == True,
+            NotificacionDispositivo.soft_delete == False
+        ).scalar()
+        
+        notificaciones_leidas = db.query(func.count(NotificacionDispositivo.id)).filter(
+            NotificacionDispositivo.leida == True,
+            NotificacionDispositivo.soft_delete == False
+        ).scalar()
+        
+        dispositivos_activos = db.query(func.count(Dispositivo.id)).filter(
+            Dispositivo.esta_online == True,
+            Dispositivo.soft_delete == False
+        ).scalar()
+        
+        return {
+            "total_notificaciones": total_notificaciones,
+            "notificaciones_enviadas": notificaciones_enviadas,
+            "notificaciones_leidas": notificaciones_leidas,
+            "dispositivos_activos": dispositivos_activos
+        }
+    except Exception as e:
+        logger.error(f"Error al obtener estadísticas de notificaciones: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al obtener estadísticas")
 
 @app.put("/notificaciones/{notificacion_id}/leer")
 async def marcar_notificacion_como_leida(
@@ -539,37 +715,33 @@ async def marcar_notificacion_como_leida(
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    try:
-        # Verificar si la notificación existe
-        notificacion = db.query(Notificacion).filter(
-            Notificacion.id == notificacion_id,
-            Notificacion.soft_delete == False
-        ).first()
-        
-        if not notificacion:
-            raise HTTPException(status_code=404, detail="Notificación no encontrada")
+    with get_db_transaction() as db:
+        try:
+            notificacion = db.query(Notificacion).filter(
+                Notificacion.id == notificacion_id,
+                Notificacion.soft_delete == False
+            ).first()
+            
+            if not notificacion:
+                raise HTTPException(status_code=404, detail="Notificación no encontrada")
 
-        # Obtener todos los dispositivos del usuario
-        dispositivos = db.query(Dispositivo).filter(Dispositivo.usuario_id == current_user.id, Dispositivo.soft_delete == False).all()
-        dispositivo_ids = [d.id for d in dispositivos]
-        
-        # Marcar como leída la notificación para todos los dispositivos del usuario
-        db.query(NotificacionDispositivo).filter(
-            NotificacionDispositivo.notificacion_id == notificacion_id,
-            NotificacionDispositivo.dispositivo_id.in_(dispositivo_ids),
-            NotificacionDispositivo.soft_delete == False
-        ).update({"leida": True})
-        
-        db.commit()
-        
-        logger.info(f"Notificación {notificacion_id} marcada como leída para todos los dispositivos del usuario {current_user.email}")
-        return {"mensaje": "Notificación marcada como leída para todos tus dispositivos"}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error al marcar notificación como leída: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error al marcar la notificación como leída")
+            dispositivos = db.query(Dispositivo).filter(Dispositivo.usuario_id == current_user.id, Dispositivo.soft_delete == False).all()
+            dispositivo_ids = [d.id for d in dispositivos]
+            
+            result = db.query(NotificacionDispositivo).filter(
+                NotificacionDispositivo.notificacion_id == notificacion_id,
+                NotificacionDispositivo.dispositivo_id.in_(dispositivo_ids),
+                NotificacionDispositivo.soft_delete == False
+            ).update({"leida": True, "sonando": False})
+            
+            if result == 0:
+                raise HTTPException(status_code=404, detail="Notificación no asociada a ninguno de tus dispositivos")
+            
+            logger.info(f"Notificación {notificacion_id} marcada como leída para todos los dispositivos del usuario {current_user.email}")
+            return {"mensaje": "Notificación marcada como leída y detenida para todos tus dispositivos"}
+        except Exception as e:
+            logger.error(f"Error al marcar notificación como leída: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error al marcar la notificación como leída")
 
 # Endpoint para notificaciones no leídas
 @app.get("/notificaciones/no-leidas", response_model=List[NotificacionSalida])
@@ -592,7 +764,7 @@ async def obtener_notificaciones_no_leidas(
             NotificacionDispositivo.soft_delete == False
         ).order_by(Notificacion.fecha_creacion.desc()).offset(skip).limit(limit).all()
 
-        # Log para depuración
+# Log para depuración
         logger.info(f"Usuario {current_user.email} solicitó notificaciones no leídas. Encontradas: {len(notificaciones)}")
         
         return notificaciones
@@ -704,12 +876,12 @@ async def eliminar_usuario(
 
 @app.put("/usuarios/cambiar_contrasena", response_model=UsuarioSalida)
 async def cambiar_contrasena(
-    nueva_contrasena: str = Body(..., embed=True),
+    nueva_contrasena: NuevaContrasena,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
-        current_user.password = get_password_hash(nueva_contrasena)
+        current_user.password = get_password_hash(nueva_contrasena.nueva_contrasena)
         db.commit()
         db.refresh(current_user)
         logger.info(f"Usuario {current_user.email} cambió su contraseña")
@@ -793,123 +965,151 @@ async def eliminar_notificacion(
         raise HTTPException(status_code=500, detail="Error al eliminar la notificación")
 
 @app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str, db: Session = Depends(get_db)):
-    await manager.connect(websocket, client_id)
+async def websocket_endpoint(websocket: WebSocket, client_id: str, token: str = Query(...)):
+    db = SessionLocal()
     try:
-        while True:
-            data = await websocket.receive_text()
-            # Procesar mensajes recibidos del cliente si es necesario
-    except WebSocketDisconnect:
-        manager.disconnect(client_id)
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        user = db.query(Usuario).filter(Usuario.email == email, Usuario.soft_delete == False).first()
+        if user is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        
+        await manager.connect(websocket, client_id, str(user.id))
+        try:
+            while True:
+                data = await websocket.receive_text()
+                # Procesar mensajes recibidos del cliente si es necesario
+        except WebSocketDisconnect:
+            manager.disconnect(client_id)
+    except jwt.PyJWTError:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
     except Exception as e:
         logger.error(f"Error en la conexión WebSocket para el cliente {client_id}: {str(e)}")
+        manager.disconnect(client_id)
+    finally:
+        db.close()
 
 # Funciones auxiliares
 async def enviar_notificaciones(notificacion_id: str):
-    db = SessionLocal()
-    try:
-        notificacion = db.query(Notificacion).filter(Notificacion.id == uuid.UUID(notificacion_id), Notificacion.soft_delete == False).first()
-        if not notificacion:
-            logger.warning(f"Notificación {notificacion_id} no encontrada al intentar enviarla")
-            return
+    with get_db_transaction() as db:
+        try:
+            notificacion = db.query(Notificacion).options(
+                joinedload(Notificacion.notificaciones_dispositivo).joinedload(NotificacionDispositivo.dispositivo)
+            ).filter(Notificacion.id == uuid.UUID(notificacion_id), Notificacion.soft_delete == False).first()
 
-        dispositivos = db.query(Dispositivo).filter(Dispositivo.soft_delete == False).all()
-        for dispositivo in dispositivos:
-            usuario = db.query(Usuario).filter(Usuario.id == dispositivo.usuario_id).first()
-            configuracion_sonido = db.query(ConfiguracionSonido).filter(ConfiguracionSonido.usuario_id == usuario.id).first()
-            sonido = configuracion_sonido.sonido if configuracion_sonido else "default.mp3"
+            if not notificacion:
+                logger.warning(f"Notificación {notificacion_id} no encontrada al intentar enviarla")
+                return
 
-            notif_dispositivo = NotificacionDispositivo(
-                notificacion_id=notificacion.id,
-                dispositivo_id=dispositivo.id
-            )
-            db.add(notif_dispositivo)
+            total_dispositivos = len(notificacion.notificaciones_dispositivo)
+            dispositivos_online = 0
+            notificaciones_enviadas = 0
+            notificaciones_fallidas = 0
 
-            if dispositivo.esta_online:
+            for notif_dispositivo in notificacion.notificaciones_dispositivo:
+                if notif_dispositivo.dispositivo.esta_online:
+                    dispositivos_online += 1
+                    usuario = db.query(Usuario).filter(Usuario.id == notif_dispositivo.dispositivo.usuario_id).first()
+                    configuracion_sonido = db.query(ConfiguracionSonido).filter(ConfiguracionSonido.usuario_id == usuario.id).first()
+                    sonido = configuracion_sonido.sonido if configuracion_sonido else "default.mp3"
+
+                    mensaje = json.dumps({
+                        "tipo": "nueva_notificacion",
+                        "notificacion": {
+                            "id": str(notificacion.id),
+                            "titulo": notificacion.titulo,
+                            "mensaje": notificacion.mensaje,
+                            "imagen_url": notificacion.imagen_url,
+                            "sonido": sonido
+                        }
+                    })
+                    try:
+                        await manager.send_personal_message(mensaje, str(notif_dispositivo.dispositivo.id))
+                        notif_dispositivo.enviada = True
+                        notif_dispositivo.fecha_envio = datetime.now(timezone.utc)
+                        notificaciones_enviadas += 1
+                        logger.info(f"Notificación {notificacion_id} enviada al dispositivo {notif_dispositivo.dispositivo.id} del usuario {usuario.email}")
+                    except Exception as e:
+                        notificaciones_fallidas += 1
+                        logger.error(f"Error al enviar notificación {notificacion_id} al dispositivo {notif_dispositivo.dispositivo.id} del usuario {usuario.email}: {str(e)}")
+
+            db.commit()
+            logger.info(f"Resumen de envío para la notificación {notificacion_id}:")
+            logger.info(f"- Total de dispositivos: {total_dispositivos}")
+            logger.info(f"- Dispositivos en línea: {dispositivos_online}")
+            logger.info(f"- Notificaciones enviadas con éxito: {notificaciones_enviadas}")
+            logger.info(f"- Notificaciones fallidas: {notificaciones_fallidas}")
+        except Exception as e:
+            logger.error(f"Error inesperado al enviar notificaciones: {str(e)}")
+            raise
+
+async def enviar_notificaciones_pendientes(dispositivo_id: str):
+    with get_db_transaction() as db:
+        try:
+            notificaciones_pendientes = db.query(NotificacionDispositivo).options(
+                joinedload(NotificacionDispositivo.notificacion)
+            ).filter(
+                NotificacionDispositivo.dispositivo_id == uuid.UUID(dispositivo_id),
+                NotificacionDispositivo.enviada == False,
+                NotificacionDispositivo.soft_delete == False
+            ).all()
+
+            for notif in notificaciones_pendientes:
+                usuario = db.query(Usuario).filter(Usuario.id == notif.dispositivo.usuario_id).first()
+                configuracion_sonido = db.query(ConfiguracionSonido).filter(ConfiguracionSonido.usuario_id == usuario.id).first()
+                sonido = configuracion_sonido.sonido if configuracion_sonido else "default.mp3"
+
                 mensaje = json.dumps({
-                    "tipo": "nueva_notificacion",
+                    "tipo": "notificacion_pendiente",
                     "notificacion": {
-                        "id": str(notificacion.id),
-                        "titulo": notificacion.titulo,
-                        "mensaje": notificacion.mensaje,
-                        "imagen_url": notificacion.imagen_url,
+                        "id": str(notif.notificacion.id),
+                        "titulo": notif.notificacion.titulo,
+                        "mensaje": notif.notificacion.mensaje,
+                        "imagen_url": notif.notificacion.imagen_url,
                         "sonido": sonido
                     }
                 })
                 try:
-                    await manager.send_personal_message(mensaje, str(dispositivo.id))
+                    await manager.send_personal_message(mensaje, dispositivo_id)
+                    notif.enviada = True
+                    notif.fecha_envio = datetime.now(timezone.utc)
                 except Exception as e:
-                    logger.error(f"Error al enviar notificación al dispositivo {dispositivo.id}: {str(e)}")
+                    logger.error(f"Error al enviar notificación pendiente al dispositivo {dispositivo_id}: {str(e)}")
 
-        db.commit()
-        logger.info(f"Notificaciones enviadas para la notificación {notificacion_id}")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error de base de datos al enviar notificaciones: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error inesperado al enviar notificaciones: {str(e)}")
-    finally:
-        db.close()
-
-async def enviar_notificaciones_pendientes(dispositivo_id: str):
-    db = SessionLocal()
-    try:
-        notificaciones_pendientes = db.query(NotificacionDispositivo).filter(
-            NotificacionDispositivo.dispositivo_id == uuid.UUID(dispositivo_id),
-            NotificacionDispositivo.enviada == False,
-            NotificacionDispositivo.soft_delete == False
-        ).all()
-
-        for notif in notificaciones_pendientes:
-            mensaje = json.dumps({
-                "tipo": "notificacion_pendiente",
-                "notificacion": {
-                    "id": str(notif.notificacion.id),
-                    "titulo": notif.notificacion.titulo,
-                    "mensaje": notif.notificacion.mensaje,
-                    "imagen_url": notif.notificacion.imagen_url
-                }
-            })
-            try:
-                await manager.send_personal_message(mensaje, dispositivo_id)
-                notif.enviada = True
-                notif.fecha_envio = datetime.now(timezone.utc)
-            except Exception as e:
-                logger.error(f"Error al enviar notificación pendiente al dispositivo {dispositivo_id}: {str(e)}")
-
-        db.commit()
-        logger.info(f"Notificaciones pendientes enviadas para el dispositivo {dispositivo_id}")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error de base de datos al enviar notificaciones pendientes: {str(e)}")
-    except Exception as e:
-        logger.error(f"Error inesperado al enviar notificaciones pendientes: {str(e)}")
-    finally:
-        db.close()
+            db.commit()
+            logger.info(f"Notificaciones pendientes enviadas para el dispositivo {dispositivo_id}")
+        except Exception as e:
+            logger.error(f"Error inesperado al enviar notificaciones pendientes: {str(e)}")
+            raise
 
 def verificar_dispositivos_inactivos():
-    db = SessionLocal()
-    try:
-        tiempo_limite = datetime.now(timezone.utc) - timedelta(minutes=15)
-        dispositivos_inactivos = db.query(Dispositivo).filter(
-            Dispositivo.esta_online == True,
-            Dispositivo.ultimo_acceso < tiempo_limite,
-            Dispositivo.soft_delete == False
-        ).all()
+    with get_db_transaction() as db:
+        try:
+            tiempo_limite = datetime.now(timezone.utc) - timedelta(minutes=15)
+            dispositivos_inactivos = db.query(Dispositivo).filter(
+                Dispositivo.esta_online == True,
+                Dispositivo.ultimo_acceso < tiempo_limite,
+                Dispositivo.soft_delete == False
+            ).all()
 
-        for dispositivo in dispositivos_inactivos:
-            dispositivo.esta_online = False
+            for dispositivo in dispositivos_inactivos:
+                dispositivo.esta_online = False
+                # Intentar cerrar la conexión WebSocket si existe
+                client_id = manager.user_connections.get(str(dispositivo.usuario_id))
+                if client_id:
+                    websocket = manager.active_connections.get(client_id)
+                    if websocket and websocket.client_state == WebSocketState.CONNECTED:
+                        asyncio.create_task(websocket.close(code=status.WS_1000_NORMAL_CLOSURE))
 
-        db.commit()
-        logger.info("Dispositivos inactivos actualizados correctamente.")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error de base de datos al verificar dispositivos inactivos: {str(e)}")
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error inesperado al verificar dispositivos inactivos: {str(e)}")
-    finally:
-        db.close()
+            db.commit()
+            logger.info(f"Dispositivos inactivos actualizados: {len(dispositivos_inactivos)}")
+        except Exception as e:
+            logger.error(f"Error inesperado al verificar dispositivos inactivos: {str(e)}")
+            raise
 
 def verificar_y_corregir_asociaciones(db: Session):
     try:
@@ -940,13 +1140,14 @@ def verificar_y_corregir_asociaciones(db: Session):
     except Exception as e:
         db.rollback()
         logger.error(f"Error al verificar y corregir asociaciones: {str(e)}")
-
+        raise
+    
 if __name__ == "__main__":
     import uvicorn
     APP_HOST = os.getenv("APP_HOST")
     APP_PORT = int(os.getenv("APP_PORT"))
-    # uvicorn.run(app, host=APP_HOST, port=APP_PORT)
- # Verificar y corregir asociaciones al inicio
+    
+    # Verificar y corregir asociaciones al inicio
     with SessionLocal() as db:
         verificar_y_corregir_asociaciones(db)
     
