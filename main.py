@@ -968,28 +968,57 @@ async def eliminar_notificacion(
 async def websocket_endpoint(websocket: WebSocket, client_id: str, token: str = Query(...)):
     db = SessionLocal()
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-        user = db.query(Usuario).filter(Usuario.email == email, Usuario.soft_delete == False).first()
-        if user is None:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-        
-        await manager.connect(websocket, client_id, str(user.id))
+        # Validar el token
         try:
-            while True:
-                data = await websocket.receive_text()
-                # Procesar mensajes recibidos del cliente si es necesario
-        except WebSocketDisconnect:
-            manager.disconnect(client_id)
-    except jwt.PyJWTError:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            email: str = payload.get("sub")
+            if email is None:
+                logger.warning(f"WebSocket conexión rechazada: token inválido para client_id {client_id}")
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+                
+            user = db.query(Usuario).filter(Usuario.email == email, Usuario.soft_delete == False).first()
+            if user is None:
+                logger.warning(f"WebSocket conexión rechazada: usuario no encontrado para client_id {client_id}")
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
+            logger.info(f"WebSocket conexión aceptada para usuario {email} con client_id {client_id}")
+            
+            # Actualizar estado del dispositivo si corresponde
+            dispositivo = db.query(Dispositivo).filter(
+                Dispositivo.id == uuid.UUID(client_id),
+                Dispositivo.usuario_id == user.id,
+                Dispositivo.soft_delete == False
+            ).first()
+            
+            if dispositivo:
+                dispositivo.esta_online = True
+                dispositivo.ultimo_acceso = datetime.now(timezone.utc)
+                db.commit()
+            
+            await manager.connect(websocket, client_id, str(user.id))
+            
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    if data == "ping":
+                        await websocket.send_text("pong")
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket desconectado para client_id {client_id}")
+                manager.disconnect(client_id)
+                if dispositivo:
+                    dispositivo.esta_online = False
+                    db.commit()
+                    
+        except jwt.PyJWTError as e:
+            logger.warning(f"WebSocket conexión rechazada: token inválido - {str(e)}")
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            
     except Exception as e:
-        logger.error(f"Error en la conexión WebSocket para el cliente {client_id}: {str(e)}")
+        logger.error(f"Error en WebSocket para client_id {client_id}: {str(e)}")
         manager.disconnect(client_id)
+        
     finally:
         db.close()
 
