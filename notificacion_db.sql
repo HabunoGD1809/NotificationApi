@@ -166,6 +166,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- no apply
 -- Crear trabajo programado para limpiar sesiones y dispositivos 
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
@@ -175,6 +176,7 @@ SELECT cron.schedule('*/15 * * * *', $$SELECT api.limpiar_sesiones_inactivas()$$
 -- Programar limpieza de dispositivos diariamente
 SELECT cron.schedule('0 0 * * *', $$SELECT api.limpiar_dispositivos_inactivos()$$);
 
+-- APPLY
 -- Modificar los triggers existentes o crear nuevos si es necesario
 CREATE OR REPLACE FUNCTION api.actualizar_fecha_modificacion()
 RETURNS TRIGGER AS $$
@@ -184,6 +186,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ERROR
 -- Asegurar que los triggers estén actualizados
 DROP TRIGGER IF EXISTS actualizar_fecha_dispositivos ON api.dispositivos;
 CREATE TRIGGER actualizar_fecha_dispositivos

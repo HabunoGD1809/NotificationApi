@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from contextlib import contextmanager, asynccontextmanager
+from functools import wraps
 
 # Librerías de terceros
 import jwt
@@ -20,7 +21,7 @@ from psycopg2 import IntegrityError
 
 # FastAPI
 from fastapi import Body, FastAPI, Depends, HTTPException, Query, Request, status, WebSocket, WebSocketDisconnect, BackgroundTasks
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.websockets import WebSocketState
@@ -31,7 +32,7 @@ from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, joinedload, relationship
 
 # Pydantic (para validación de datos en FastAPI)
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ValidationError, field_validator, FieldValidationInfo
 
 # Inicializar colorama
 init(autoreset=True)
@@ -86,7 +87,7 @@ class Dispositivo(Base):
     usuario_id = Column(UUID(as_uuid=True), ForeignKey("api.usuarios.id", ondelete="CASCADE"))
     session_id = Column(String(255), unique=True)
     device_id = Column(String(255))
-    device_name = Column(String(255))
+    device_name = Column(String(255), nullable=False, default="Dispositivo sin nombre") #cambio 20 y pico
     esta_online = Column(Boolean, default=False)
     ultimo_acceso = Column(DateTime(timezone=True), server_default=func.now())
     modelo = Column(String(100))
@@ -179,10 +180,10 @@ class DispositivoCrear(BaseModel):
     modelo: Optional[str]
     sistema_operativo: Optional[str]
 
-# cambio 7.1
+# cambio 7.1 cambio update 25/10/2024
 class DispositivoSalida(BaseModel):
     id: uuid.UUID
-    device_name: str
+    device_name: Optional[str]  # Permitir valores nulos
     esta_online: bool
     ultimo_acceso: datetime
     modelo: Optional[str]
@@ -190,6 +191,10 @@ class DispositivoSalida(BaseModel):
 
     class Config:
         from_attributes = True
+
+    @field_validator('device_name')
+    def set_default_name(cls, v, info: FieldValidationInfo):
+        return v or "Dispositivo sin nombre"
 
 class NotificacionCrear(BaseModel):
     titulo: str
@@ -207,10 +212,18 @@ class NotificacionSalida(BaseModel):
     class Config:
         from_attributes = True
 
+# cambio 14 25/10/2024
 class Token(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str
+    session_id: str
+    expires_in: int
+    user_info: dict
+    device_info: dict
+
+    class Config:
+        from_attributes = True
 
 class TokenData(BaseModel):
     email: Optional[str] = None
@@ -218,17 +231,39 @@ class TokenData(BaseModel):
 class EstadoDispositivo(BaseModel):
     esta_online: bool
 
-# Función para obtener la base de datos
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# Decoradores
+def require_admin(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        current_user = None
+        # Buscar current_user en los argumentos
+        for arg in args:
+            if isinstance(arg, Usuario):
+                current_user = arg
+                break
+        if not current_user:
+            for value in kwargs.values():
+                if isinstance(value, Usuario):
+                    current_user = value
+                    break
 
-# Context manager para transacciones
+        if not current_user or not current_user.es_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Se requieren privilegios de administrador para esta operación"
+            )
+        return await func(*args, **kwargs)
+    return wrapper
+
+# 
+
+"""
+    cambio 17 25/10/2024 
+    Unificación de gestión de sesiones DB 
+    Reemplaza tanto get_db() como get_db_session()
+"""
 @contextmanager
-def get_db_transaction():
+def get_db_session():
     db = SessionLocal()
     try:
         yield db
@@ -238,6 +273,11 @@ def get_db_transaction():
         raise
     finally:
         db.close()
+
+# Función helper para obtener DB en FastAPI endpoints
+def get_db():
+    with get_db_session() as db:
+        yield db
 
 # Configuración de OAuth2
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -462,24 +502,57 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 # Rutas de la API
 
-# cambio 2
+# cambio 2 cambio 2.changes 25/10/2024
 @app.post("/token", response_model=Token)
 async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    device_info: DispositivoCrear = Body(...),
+    request: Request,
     db: Session = Depends(get_db)
 ):
     try:
+        # Obtener datos del formulario
+        form_data = await request.form()
+        
+        # Validar campos requeridos del formulario
+        required_fields = ['username', 'password', 'device_id', 'device_name']
+        missing_fields = [field for field in required_fields if not form_data.get(field)]
+        
+        if missing_fields:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "Campos requeridos faltantes",
+                    "missing_fields": missing_fields
+                }
+            )
+
+        # Validar y crear objeto DispositivoCrear
+        try:
+            device_info = DispositivoCrear(
+                device_id=form_data.get('device_id'),
+                device_name=form_data.get('device_name'),
+                modelo=form_data.get('modelo'),
+                sistema_operativo=form_data.get('sistema_operativo')
+            )
+        except ValidationError as e:
+            logger.error(f"Error de validación en device_info: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "Error de validación en la información del dispositivo",
+                    "details": e.errors()
+                }
+            )
+
         # Validar credenciales
         user = db.query(Usuario).filter(
-            Usuario.email == form_data.username,
+            Usuario.email == form_data.get('username'),
             Usuario.soft_delete == False
         ).first()
         
-        if not user or not verify_password(form_data.password, user.password):
-            logger.warning(f"Intento de login fallido para el email: {form_data.username}")
+        if not user or not verify_password(form_data.get('password'), user.password):
+            logger.warning(f"Intento de login fallido para el email: {form_data.get('username')}")
             raise HTTPException(
-                status_code=401,
+                status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Credenciales incorrectas"
             )
 
@@ -490,108 +563,117 @@ async def login_for_access_token(
         # Cerrar sesión anterior si existe
         await cerrar_sesiones_anteriores(user.id, db)
 
-        # Buscar o crear dispositivo
-        dispositivo = db.query(Dispositivo).filter(
-            Dispositivo.usuario_id == user.id,
-            Dispositivo.device_id == device_info.device_id,
-            Dispositivo.soft_delete == False
-        ).first()
+        try:
+            # Buscar o crear dispositivo
+            dispositivo = db.query(Dispositivo).filter(
+                Dispositivo.usuario_id == user.id,
+                Dispositivo.device_id == device_info.device_id,
+                Dispositivo.soft_delete == False
+            ).first()
 
-        if dispositivo:
-            # Actualizar dispositivo existente
-            dispositivo.session_id = new_session_id
-            dispositivo.esta_online = True
-            dispositivo.ultimo_acceso = current_timestamp
-            dispositivo.fecha_actualizacion = current_timestamp
-            if device_info.device_name:
-                dispositivo.device_name = device_info.device_name
-            if device_info.modelo:
-                dispositivo.modelo = device_info.modelo
-            if device_info.sistema_operativo:
-                dispositivo.sistema_operativo = device_info.sistema_operativo
-            
-            logger.info(f"Dispositivo actualizado: {device_info.device_id}")
-        else:
-            # Crear nuevo dispositivo
-            dispositivo = Dispositivo(
-                usuario_id=user.id,
-                device_id=device_info.device_id,
-                device_name=device_info.device_name,
-                session_id=new_session_id,
-                modelo=device_info.modelo,
-                sistema_operativo=device_info.sistema_operativo,
-                esta_online=True,
-                ultimo_acceso=current_timestamp,
-                fecha_creacion=current_timestamp,
-                fecha_actualizacion=current_timestamp
+            if dispositivo:
+                # Actualizar dispositivo existente
+                dispositivo.session_id = new_session_id
+                dispositivo.esta_online = True
+                dispositivo.ultimo_acceso = current_timestamp
+                dispositivo.fecha_actualizacion = current_timestamp
+                if device_info.device_name:
+                    dispositivo.device_name = device_info.device_name
+                if device_info.modelo:
+                    dispositivo.modelo = device_info.modelo
+                if device_info.sistema_operativo:
+                    dispositivo.sistema_operativo = device_info.sistema_operativo
+                
+                logger.info(f"Dispositivo actualizado: {device_info.device_id}")
+            else:
+                # Crear nuevo dispositivo
+                dispositivo = Dispositivo(
+                    usuario_id=user.id,
+                    device_id=device_info.device_id,
+                    device_name=device_info.device_name,
+                    session_id=new_session_id,
+                    modelo=device_info.modelo,
+                    sistema_operativo=device_info.sistema_operativo,
+                    esta_online=True,
+                    ultimo_acceso=current_timestamp,
+                    fecha_creacion=current_timestamp,
+                    fecha_actualizacion=current_timestamp
+                )
+                db.add(dispositivo)
+                logger.info(f"Nuevo dispositivo registrado: {device_info.device_id}")
+
+            # Generar tokens con información adicional de seguridad
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token, _ = create_access_token(
+                data={
+                    "sub": user.email,
+                    "session_id": new_session_id,
+                    "device_id": device_info.device_id,
+                    "iat": current_timestamp.timestamp(),
+                    "login_timestamp": current_timestamp.isoformat()
+                },
+                expires_delta=access_token_expires
             )
-            db.add(dispositivo)
-            logger.info(f"Nuevo dispositivo registrado: {device_info.device_id}")
+            
+            refresh_token = create_refresh_token(
+                data={
+                    "sub": str(user.id),
+                    "device_id": device_info.device_id,
+                    "session_id": new_session_id
+                },
+                db=db
+            )
 
-        # Generar tokens con información adicional de seguridad
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token, _ = create_access_token(
-            data={
-                "sub": user.email,
+            # Commit de la transacción
+            db.commit()
+
+            # Registrar el evento de login exitoso
+            logger.info(
+                f"Login exitoso para {user.email} "
+                f"(session_id: {new_session_id}, "
+                f"device_id: {device_info.device_id})"
+            )
+            
+            # Preparar respuesta
+            response_data = {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "bearer",
                 "session_id": new_session_id,
-                "device_id": device_info.device_id,
-                "iat": current_timestamp.timestamp(),
-                "login_timestamp": current_timestamp.isoformat()
-            },
-            expires_delta=access_token_expires
-        )
-        
-        refresh_token = create_refresh_token(
-            data={
-                "sub": str(user.id),
-                "device_id": device_info.device_id,
-                "session_id": new_session_id
-            },
-            db=db
-        )
-
-        # Registrar el evento de login
-        logger.info(
-            f"Login exitoso para {user.email} "
-            f"(session_id: {new_session_id}, "
-            f"device_id: {device_info.device_id})"
-        )
-
-        # Commit de la transacción
-        db.commit()
-        
-        # Preparar respuesta
-        response_data = {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-            "session_id": new_session_id,
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            "user_info": {
-                "id": str(user.id),
-                "email": user.email,
-                "nombre": user.nombre,
-                "es_admin": user.es_admin
-            },
-            "device_info": {
-                "device_id": device_info.device_id,
-                "device_name": device_info.device_name,
-                "session_created_at": current_timestamp.isoformat()
+                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+                "user_info": {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "nombre": user.nombre,
+                    "es_admin": user.es_admin
+                },
+                "device_info": {
+                    "device_id": device_info.device_id,
+                    "device_name": device_info.device_name,
+                    "session_created_at": current_timestamp.isoformat()
+                }
             }
-        }
 
-        return response_data
+            return response_data
+
+        except IntegrityError as e:
+            db.rollback()
+            logger.error(f"Error de integridad en la base de datos: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Error de integridad en la base de datos"
+            )
 
     except HTTPException as he:
         raise he
     except Exception as e:
         db.rollback()
-        logger.error(f"Error en login: {str(e)}", exc_info=True)
+        logger.error(f"Error inesperado en login: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error interno en el proceso de login"
         )
-
+        
 # cambio 2.1
 # nuevo endpoint 
 @app.get("/sesion-activa")
@@ -629,170 +711,173 @@ async def obtener_sesion_activa(
             detail="Error al obtener información de la sesión"
         )
 
-
-# cambio 3
+# cambio 3... Update cambio 15 25/10/2024
 @app.post("/token/refresh", response_model=Token)
 async def refresh_token(
-    refresh_token: str = Body(..., embed=True),
+    request: Request,
     db: Session = Depends(get_db)
 ):
     try:
+        form_data = await request.form()
+        refresh_token = form_data.get('refresh_token')
+        
+        if not refresh_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="refresh_token es requerido"
+            )
+
         current_timestamp = datetime.now(timezone.utc)
 
-        # Verificar el token de refresco
-        db_token = db.query(RefreshToken).filter(
-            RefreshToken.token == refresh_token,
-            RefreshToken.soft_delete == False
-        ).first()
-        
-        if not db_token:
-            logger.warning(f"Intento de refresh con token inválido: {refresh_token[:10]}...")
-            raise HTTPException(
-                status_code=400,
-                detail="Token de refresco inválido"
+        try:
+            # Verificar el token de refresco
+            db_token = db.query(RefreshToken).filter(
+                RefreshToken.token == refresh_token,
+                RefreshToken.soft_delete == False
+            ).first()
+            
+            if not db_token:
+                logger.warning(f"Intento de refresh con token inválido: {refresh_token[:10]}...")
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token de refresco inválido"
+                )
+
+            # Convertir fecha_expiracion a UTC si no lo está
+            if db_token.fecha_expiracion.tzinfo is None:
+                expiracion = db_token.fecha_expiracion.replace(tzinfo=timezone.utc)
+            else:
+                expiracion = db_token.fecha_expiracion
+
+            # Verificar expiración
+            if expiracion < current_timestamp:
+                logger.warning(f"Intento de refresh con token expirado para usuario_id: {db_token.usuario_id}")
+                db_token.soft_delete = True
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Token de refresco expirado"
+                )
+
+            # Obtener usuario
+            user = db.query(Usuario).filter(
+                Usuario.id == db_token.usuario_id,
+                Usuario.soft_delete == False
+            ).first()
+            
+            if not user:
+                logger.warning(f"Usuario no encontrado para refresh token: {db_token.usuario_id}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Usuario no encontrado"
+                )
+
+            # Obtener el dispositivo activo actual
+            dispositivo = db.query(Dispositivo).filter(
+                Dispositivo.usuario_id == user.id,
+                Dispositivo.esta_online == True,
+                Dispositivo.soft_delete == False
+            ).first()
+
+            if not dispositivo or not dispositivo.session_id:
+                logger.warning(f"No hay sesión activa para el usuario: {user.email}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No hay sesión activa"
+                )
+
+            # Actualizar último acceso del dispositivo
+            dispositivo.ultimo_acceso = current_timestamp
+            dispositivo.fecha_actualizacion = current_timestamp
+
+            # Generar nuevo access token manteniendo el mismo session_id
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token, _ = create_access_token(
+                data={
+                    "sub": user.email,
+                    "session_id": dispositivo.session_id,
+                    "device_id": dispositivo.device_id,
+                    "iat": current_timestamp.timestamp(),
+                    "refresh_timestamp": current_timestamp.isoformat()
+                },
+                expires_delta=access_token_expires
             )
 
-        # Verificar expiración
-        if db_token.fecha_expiracion < current_timestamp:
-            logger.warning(f"Intento de refresh con token expirado para usuario_id: {db_token.usuario_id}")
-            # Marcar el token como inválido
+            # Generar nuevo refresh token
+            new_refresh_token = create_refresh_token(
+                data={
+                    "sub": str(user.id),
+                    "device_id": dispositivo.device_id,
+                    "session_id": dispositivo.session_id
+                },
+                db=db
+            )
+            
+            # Invalidar el token anterior
             db_token.soft_delete = True
+            db_token.fecha_actualizacion = current_timestamp
+
+            # Limpiar tokens antiguos del usuario
+            db.query(RefreshToken).filter(
+                RefreshToken.usuario_id == user.id,
+                RefreshToken.fecha_expiracion < current_timestamp,
+                RefreshToken.soft_delete == False
+            ).update({
+                "soft_delete": True,
+                "fecha_actualizacion": current_timestamp
+            })
+
             db.commit()
-            raise HTTPException(
-                status_code=400,
-                detail="Token de refresco expirado"
+
+            logger.info(
+                f"Token refrescado exitosamente para {user.email} "
+                f"(session_id: {dispositivo.session_id}, "
+                f"device_id: {dispositivo.device_id})"
             )
-
-        # Obtener usuario
-        user = db.query(Usuario).filter(
-            Usuario.id == db_token.usuario_id,
-            Usuario.soft_delete == False
-        ).first()
-        
-        if not user:
-            logger.warning(f"Usuario no encontrado para refresh token: {db_token.usuario_id}")
-            raise HTTPException(
-                status_code=404,
-                detail="Usuario no encontrado"
-            )
-
-        # Obtener el dispositivo activo actual
-        dispositivo = db.query(Dispositivo).filter(
-            Dispositivo.usuario_id == user.id,
-            Dispositivo.esta_online == True,
-            Dispositivo.soft_delete == False
-        ).first()
-
-        if not dispositivo or not dispositivo.session_id:
-            logger.warning(f"No hay sesión activa para el usuario: {user.email}")
-            raise HTTPException(
-                status_code=400,
-                detail="No hay sesión activa"
-            )
-
-        # Actualizar último acceso del dispositivo
-        dispositivo.ultimo_acceso = current_timestamp
-        dispositivo.fecha_actualizacion = current_timestamp
-
-        # Generar nuevo access token manteniendo el mismo session_id
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token, _ = create_access_token(
-            data={
-                "sub": user.email,
+            
+            return {
+                "access_token": access_token,
+                "refresh_token": new_refresh_token,
+                "token_type": "bearer",
                 "session_id": dispositivo.session_id,
-                "device_id": dispositivo.device_id,
-                "iat": current_timestamp.timestamp(),
-                "refresh_timestamp": current_timestamp.isoformat()
-            },
-            expires_delta=access_token_expires
-        )
-
-        # Generar nuevo refresh token
-        new_refresh_token = create_refresh_token(
-            data={
-                "sub": str(user.id),
-                "device_id": dispositivo.device_id,
-                "session_id": dispositivo.session_id
-            },
-            db=db
-        )
-        
-        # Invalidar el token anterior
-        db_token.soft_delete = True
-        db_token.fecha_actualizacion = current_timestamp
-
-        # Limpiar tokens antiguos del usuario
-        db.query(RefreshToken).filter(
-            RefreshToken.usuario_id == user.id,
-            RefreshToken.fecha_expiracion < current_timestamp,
-            RefreshToken.soft_delete == False
-        ).update({
-            "soft_delete": True,
-            "fecha_actualizacion": current_timestamp
-        })
-
-        db.commit()
-
-        logger.info(
-            f"Token refrescado exitosamente para {user.email} "
-            f"(session_id: {dispositivo.session_id}, "
-            f"device_id: {dispositivo.device_id})"
-        )
-        
-        # Preparar respuesta
-        response_data = {
-            "access_token": access_token,
-            "refresh_token": new_refresh_token,
-            "token_type": "bearer",
-            "session_id": dispositivo.session_id,
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,  # en segundos
-            "user_info": {
-                "id": str(user.id),
-                "email": user.email,
-                "nombre": user.nombre,
-                "es_admin": user.es_admin
-            },
-            "device_info": {
-                "device_id": dispositivo.device_id,
-                "device_name": dispositivo.device_name,
-                "ultimo_acceso": dispositivo.ultimo_acceso.isoformat()
+                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+                "user_info": {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "nombre": user.nombre,
+                    "es_admin": user.es_admin
+                },
+                "device_info": {
+                    "device_id": dispositivo.device_id,
+                    "device_name": dispositivo.device_name,
+                    "session_created_at": dispositivo.ultimo_acceso.isoformat()
+                }
             }
-        }
 
-        return response_data
+        except HTTPException:
+            raise
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error en la actualización de tokens: {str(e)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Error al procesar la renovación del token"
+            )
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        db.rollback()
         logger.error(f"Error en refresh token: {str(e)}", exc_info=True)
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error al renovar el token"
         )
 
+# cambio 14
+# endpoint deleted 25/10/2024
 # Manejo de tokens de dispositivo
-@app.put("/dispositivos/{dispositivo_id}/token")
-async def actualizar_token_dispositivo(
-    dispositivo_id: uuid.UUID,
-    nuevo_token: str = Body(..., embed=True),
-    current_user: Usuario = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        dispositivo = db.query(Dispositivo).filter(Dispositivo.id == dispositivo_id, Dispositivo.usuario_id == current_user.id, Dispositivo.soft_delete == False).first()
-        if not dispositivo:
-            raise HTTPException(status_code=404, detail="Dispositivo no encontrado")
-        dispositivo.token = nuevo_token
-        db.commit()
-        logger.info(f"Token actualizado para el dispositivo {dispositivo_id}")
-        return {"mensaje": "Token de dispositivo actualizado correctamente"}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Error al actualizar token de dispositivo: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error al actualizar el token del dispositivo")
+# @app.put("/dispositivos/{dispositivo_id}/token")
+# Ya no es relevante con la nueva arquitectura de sesiones que estamos usando
 
 @app.post("/usuarios", response_model=UsuarioSalida)
 async def crear_usuario(usuario: UsuarioCrear, db: Session = Depends(get_db)):
@@ -825,48 +910,31 @@ async def leer_usuario_actual(current_user: Usuario = Depends(get_current_user))
     logger.info(f"Usuario {current_user.email} accedió a su perfil")
     return current_user
 
-@app.post("/dispositivos", response_model=DispositivoSalida)
-async def registrar_dispositivo(
-    dispositivo: DispositivoCrear,
+# nuevo endpoint 25/10/2024
+@app.get("/usuarios", response_model=List[UsuarioSalida])
+@require_admin  # Solo los administradores pueden ver la lista de usuarios
+async def obtener_usuarios(
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
-        db_dispositivo = Dispositivo(
-            usuario_id=current_user.id,
-            token=dispositivo.token,
-            modelo=dispositivo.modelo,
-            sistema_operativo=dispositivo.sistema_operativo
-        )
-        db.add(db_dispositivo)
-        db.flush()  # Para obtener el ID del dispositivo
-
-        # Crear entradas en NotificacionDispositivo para notificaciones existentes
-        notificaciones_existentes = db.query(Notificacion).filter(Notificacion.soft_delete == False).all()
-        for notificacion in notificaciones_existentes:
-            notif_dispositivo = NotificacionDispositivo(
-                notificacion_id=notificacion.id,
-                dispositivo_id=db_dispositivo.id,
-                leida=False
-            )
-            db.add(notif_dispositivo)
-
-        db.commit()
-        db.refresh(db_dispositivo)
-        logger.info(f"Dispositivo {dispositivo.token} registrado para el usuario {current_user.email}")
-        return db_dispositivo
-    except IntegrityError as e:
-        db.rollback()
-        if "dispositivos_token_key" in str(e.orig):
-            logger.info(f"Intento de registrar dispositivo con token duplicado: {dispositivo.token}")
-            raise HTTPException(status_code=400, detail="El token del dispositivo ya está registrado")
-        else:
-            logger.error(f"Error de integridad al registrar dispositivo: {str(e)}")
-            raise HTTPException(status_code=400, detail="Error al registrar dispositivo")
+        usuarios = db.query(Usuario).filter(
+            Usuario.soft_delete == False
+        ).all()
+        
+        logger.info(f"Lista de usuarios solicitada por el administrador {current_user.email}")
+        return usuarios
+        
     except Exception as e:
-        db.rollback()
-        logger.error(f"Error al registrar dispositivo: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error interno al registrar dispositivo")
+        logger.error(f"Error al obtener lista de usuarios: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error al obtener la lista de usuarios"
+        )
+
+# cambio 16 25/10/2024
+# este endpoint ya no es necesario pues la entrada de dispositivos la hacemos en el login
+# @app.post("/dispositivos", response_model=DispositivoSalida)
 
 # cambio 11
 # Ruta para que los dispositivos informen su estado
@@ -913,7 +981,7 @@ async def reenviar_notificacion(
     if not current_user.es_admin:
         raise HTTPException(status_code=403, detail="No tienes permiso para reenviar notificaciones")
     
-    with get_db_transaction() as db:
+    with get_db_session() as db:
         try:
             notificacion = db.query(Notificacion).filter(
                 Notificacion.id == notificacion_id,
@@ -938,17 +1006,15 @@ async def reenviar_notificacion(
             logger.error(f"Error al reenviar notificación: {str(e)}")
             raise HTTPException(status_code=500, detail="Error al reenviar la notificación")
 
-# cambio 5
+# cambio 5... cambio 18 aplicacion del decorador 25/10/2024
 @app.post("/notificaciones", response_model=NotificacionSalida)
+@require_admin
 async def crear_notificacion(
     notificacion: NotificacionCrear,
     background_tasks: BackgroundTasks,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        raise HTTPException(status_code=403, detail="No tienes permiso para crear notificaciones")
-    
     try:
         db_notificacion = Notificacion(**notificacion.model_dump())
         db.add(db_notificacion)
@@ -1005,16 +1071,17 @@ async def leer_notificaciones(
         logger.error(f"Error al leer notificaciones paginadas: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al obtener las notificaciones")
 
+# cambio 19 aplicacion del decorador require_admin 25/10/2024
 @app.get("/notificaciones/estadisticas")
+@require_admin
 async def obtener_estadisticas_notificaciones(
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        raise HTTPException(status_code=403, detail="No tienes permiso para ver estadísticas")
-    
     try:
-        total_notificaciones = db.query(func.count(Notificacion.id)).filter(Notificacion.soft_delete == False).scalar()
+        total_notificaciones = db.query(func.count(Notificacion.id)).filter(
+            Notificacion.soft_delete == False
+        ).scalar()
         
         notificaciones_enviadas = db.query(func.count(NotificacionDispositivo.id)).filter(
             NotificacionDispositivo.enviada == True,
@@ -1043,15 +1110,14 @@ async def obtener_estadisticas_notificaciones(
 
 # cambio 6
 # nuevo endpoint
+# cambio 20 aplicacion del decorador require_admin 25/10/2024
 @app.get("/notificaciones/{notificacion_id}/estado")
+@require_admin
 async def obtener_estado_notificacion(
     notificacion_id: uuid.UUID,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        raise HTTPException(status_code=403, detail="No tienes permiso para ver el estado de las notificaciones")
-
     try:
         # Obtener estadísticas de entrega
         estados = db.query(
@@ -1079,7 +1145,7 @@ async def marcar_notificacion_como_leida(
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    with get_db_transaction() as db:
+    with get_db_session() as db:
         try:
             notificacion = db.query(Notificacion).filter(
                 Notificacion.id == notificacion_id,
@@ -1171,13 +1237,13 @@ async def obtener_configuracion_sonido(
         logger.error(f"Error al obtener configuración de sonido: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al obtener la configuración de sonido")
 
+# cambio 21 aplicacion del decorador require_admin 25/10/2024
 @app.get("/dispositivos", response_model=List[DispositivoSalida])
+@require_admin
 async def leer_dispositivos(
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        raise HTTPException(status_code=403, detail="No tienes permiso para ver los dispositivos")
     try:
         dispositivos = db.query(Dispositivo).filter(Dispositivo.soft_delete == False).all()
         logger.info(f"Usuario administrador {current_user.email} accedió a los dispositivos")
@@ -1215,14 +1281,14 @@ async def actualizar_estado_dispositivo(
         logger.error(f"Error al actualizar estado del dispositivo: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al actualizar el estado del dispositivo")
 
+# cambio 22 aplicacion del decorador require_admin 25/10/2024
 @app.delete("/usuarios/{usuario_id}")
+@require_admin
 async def eliminar_usuario(
     usuario_id: uuid.UUID,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        raise HTTPException(status_code=403, detail="No tienes permiso para eliminar usuarios")
     try:
         usuario = db.query(Usuario).filter(Usuario.id == usuario_id, Usuario.soft_delete == False).first()
         if not usuario:
@@ -1255,16 +1321,15 @@ async def cambiar_contrasena(
         logger.error(f"Error al cambiar contraseña: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al cambiar la contraseña")
 
+# cambio 23 aplicacion del decorador require_admin 25/10/2024
 @app.put("/usuarios/{usuario_id}/restablecer_contrasena", response_model=UsuarioSalida)
+@require_admin
 async def restablecer_contrasena(
     usuario_id: uuid.UUID,
     nueva_contrasena: NuevaContrasena,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        logger.warning(f"Usuario no autorizado {current_user.email} intentó restablecer una contraseña")
-        raise HTTPException(status_code=403, detail="No tienes permiso para restablecer contraseñas")
     try:
         usuario = db.query(Usuario).filter(Usuario.id == usuario_id, Usuario.soft_delete == False).first()
         if not usuario:
@@ -1305,14 +1370,14 @@ async def eliminar_dispositivo(
         logger.error(f"Error al eliminar dispositivo: {str(e)}")
         raise HTTPException(status_code=500, detail="Error al eliminar el dispositivo")
 
+# cambio 24 aplicacion del decorador require_admin 25/10/2024
 @app.delete("/notificaciones/{notificacion_id}")
+@require_admin
 async def eliminar_notificacion(
     notificacion_id: uuid.UUID,
     current_user: Usuario = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not current_user.es_admin:
-        raise HTTPException(status_code=403, detail="No tienes permiso para eliminar notificaciones")
     try:
         notificacion = db.query(Notificacion).filter(Notificacion.id == notificacion_id, Notificacion.soft_delete == False).first()
         if not notificacion:
@@ -1374,22 +1439,42 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
             # Establecer conexión WebSocket
             await manager.connect(websocket, session_id, str(user.id))
             
+            # Iniciar un bucle de ping-pong en segundo plano
+            ping_task = asyncio.create_task(keep_connection_alive(websocket))
+            
             try:
                 while True:
-                    data = await websocket.receive_text()
-                    data_json = json.loads(data)
-                    
-                    if data_json.get("tipo") == "ping":
-                        await websocket.send_text(json.dumps({"tipo": "pong"}))
-                        # Actualizar último acceso
-                        dispositivo.ultimo_acceso = datetime.now(timezone.utc)
-                        db.commit()
+                    # Usar un timeout para el receive_text
+                    try:
+                        data = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+                        data_json = json.loads(data)
+                        
+                        if data_json.get("tipo") == "ping":
+                            await websocket.send_text(json.dumps({"tipo": "pong"}))
+                            # Actualizar último acceso
+                            dispositivo.ultimo_acceso = datetime.now(timezone.utc)
+                            db.commit()
+                        
+                    except asyncio.TimeoutError:
+                        # Verificar si la conexión sigue activa
+                        if websocket.client_state == WebSocketState.DISCONNECTED:
+                            raise WebSocketDisconnect()
+                        continue
                     
             except WebSocketDisconnect:
                 logger.info(f"WebSocket desconectado para session_id {session_id}")
-                manager.disconnect(session_id)
+            finally:
+                # Cancelar la tarea de ping
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+                
+                # Actualizar estado del dispositivo y desconectar
                 dispositivo.esta_online = False
                 db.commit()
+                manager.disconnect(session_id)
                     
         except jwt.PyJWTError as e:
             logger.warning(f"WebSocket conexión rechazada: error en token - {str(e)}")
@@ -1397,16 +1482,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, token: str =
             
     except Exception as e:
         logger.error(f"Error en WebSocket para session_id {session_id}: {str(e)}")
-        manager.disconnect(session_id)
+        if session_id in manager.active_connections:
+            manager.disconnect(session_id)
         
     finally:
         db.close()
 
+async def keep_connection_alive(websocket: WebSocket):
+    """Mantiene la conexión WebSocket activa mediante ping-pong periódicos"""
+    while True:
+        try:
+            if websocket.client_state == WebSocketState.DISCONNECTED:
+                break
+            await websocket.send_text(json.dumps({"tipo": "ping"}))
+            await asyncio.sleep(30)  # Enviar ping cada 30 segundos
+        except Exception as e:
+            logger.error(f"Error en keep_connection_alive: {str(e)}")
+            break
 # Funciones auxiliares
 
 # cambio 4
 async def enviar_notificaciones(notificacion_id: str):
-    with get_db_transaction() as db:
+    with get_db_session() as db:
         try:
             notificacion = db.query(Notificacion).filter(
                 Notificacion.id == uuid.UUID(notificacion_id),
@@ -1483,7 +1580,7 @@ async def enviar_notificaciones(notificacion_id: str):
             raise
 
 async def enviar_notificaciones_pendientes(dispositivo_id: str):
-    with get_db_transaction() as db:
+    with get_db_session() as db:
         try:
             notificaciones_pendientes = db.query(NotificacionDispositivo).options(
                 joinedload(NotificacionDispositivo.notificacion)
@@ -1521,8 +1618,9 @@ async def enviar_notificaciones_pendientes(dispositivo_id: str):
             logger.error(f"Error inesperado al enviar notificaciones pendientes: {str(e)}")
             raise
 
+# cambio 13 25/10/2024
 def verificar_dispositivos_inactivos():
-    with get_db_transaction() as db:
+    with get_db_session() as db:
         try:
             tiempo_limite = datetime.now(timezone.utc) - timedelta(minutes=15)
             dispositivos_inactivos = db.query(Dispositivo).filter(
@@ -1534,9 +1632,9 @@ def verificar_dispositivos_inactivos():
             for dispositivo in dispositivos_inactivos:
                 dispositivo.esta_online = False
                 # Intentar cerrar la conexión WebSocket si existe
-                client_id = manager.user_connections.get(str(dispositivo.usuario_id))
-                if client_id:
-                    websocket = manager.active_connections.get(client_id)
+                session_id = manager.user_sessions.get(str(dispositivo.usuario_id))
+                if session_id:
+                    websocket = manager.active_connections.get(session_id)
                     if websocket and websocket.client_state == WebSocketState.CONNECTED:
                         asyncio.create_task(websocket.close(code=status.WS_1000_NORMAL_CLOSURE))
 
@@ -1576,7 +1674,25 @@ def verificar_y_corregir_asociaciones(db: Session):
         db.rollback()
         logger.error(f"Error al verificar y corregir asociaciones: {str(e)}")
         raise
-    
+
+# Script de migración para actualizar registros existentes
+def actualizar_nombres_dispositivos():
+    with get_db_session() as db:
+        try:
+            db.query(Dispositivo).filter(
+                Dispositivo.device_name.is_(None),
+                Dispositivo.soft_delete == False
+            ).update(
+                {"device_name": "Dispositivo sin nombre"}, 
+                synchronize_session=False
+            )
+            db.commit()
+            logger.info("Nombres de dispositivos actualizados correctamente")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error al actualizar nombres de dispositivos: {str(e)}")
+            raise
+
 if __name__ == "__main__":
     import uvicorn
     APP_HOST = os.getenv("APP_HOST")
@@ -1585,5 +1701,6 @@ if __name__ == "__main__":
     # Verificar y corregir asociaciones al inicio
     with SessionLocal() as db:
         verificar_y_corregir_asociaciones(db)
+        actualizar_nombres_dispositivos()  
     
     uvicorn.run(app, host=APP_HOST, port=APP_PORT)
